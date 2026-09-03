@@ -37,6 +37,14 @@ if(PX4_CRYPTO)
 	list(APPEND LOGGER_MODULE_PARAMS module_params_crypto.yaml)
 endif()
 
+set(LOGGER_PREARM_SRCS)
+set(LOGGER_PREARM_DEPENDS)
+
+if(CONFIG_LOGGER_PREARM)
+	list(APPEND LOGGER_PREARM_SRCS log_writer_ram.cpp)
+	list(APPEND LOGGER_PREARM_DEPENDS variable_length_ringbuffer)
+endif()
+
 px4_add_module(
 	MODULE modules__logger
 	MAIN logger
@@ -54,12 +62,14 @@ px4_add_module(
 		log_writer.cpp
 		log_writer_file.cpp
 		log_writer_mavlink.cpp
+		${LOGGER_PREARM_SRCS}
 		util.cpp
 		util_parse.cpp
 		watchdog.cpp
 	DEPENDS
 		version
 		component_general_json # for checksums.h
+		${LOGGER_PREARM_DEPENDS}
 	)
 
 px4_add_unit_gtest(SRC ULogMessagesTest.cpp)

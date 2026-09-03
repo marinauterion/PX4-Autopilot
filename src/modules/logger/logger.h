@@ -34,6 +34,7 @@
 #pragma once
 
 #include "log_writer.h"
+#include "log_writer_ram.h"
 #include "logged_topics.h"
 #include "messages.h"
 #include "watchdog.h"
@@ -167,6 +168,23 @@ private:
 		CONFIG_BOARD_ROOT_PATH "/mission_log"
 	};
 
+#if defined(CONFIG_LOGGER_PREARM)
+	static constexpr hrt_abstime PRE_ARM_WINDOW_DURATION {5_s};
+	// timewindow to measure throuput to setup buffersize
+	// NOT WORKING YET: values returned are way higher than the actual throuput!!!!!!
+	static constexpr hrt_abstime PRE_ARM_MEASURE_GRACE_PERIOD {10_s};
+	static constexpr size_t PRE_ARM_BUFFER_SIZE_FLOOR = 16 * 1024;
+	static constexpr size_t PRE_ARM_MAX_RECORDS_FLOOR = 100;
+
+	/** tags a record buffered in _pre_arm_writer with which subscription it came from */
+	struct PreArmRecordMetadata {
+		uint16_t sub_idx;
+		uint16_t data_len;
+	};
+
+	void start_pre_arm_buffer();
+#endif // CONFIG_LOGGER_PREARM
+
 	struct LogFileName {
 		char log_dir[12];           ///< e.g. "2018-01-01" or "sess001"
 		int sess_dir_index{1};      ///< search starting index for 'sess<i>' directory name
@@ -286,6 +304,8 @@ private:
 
 	inline bool copy_if_updated(int sub_idx, void *buffer, bool try_to_subscribe);
 
+	void pack_data_message_header(uint16_t msg_id, size_t msg_size);
+
 	/**
 	 * Write exactly one ulog message to the logger and handle dropouts.
 	 * Must be called with _writer.lock() held.
@@ -315,6 +335,10 @@ private:
 
 	void handle_vehicle_command_update();
 	void ack_vehicle_command(vehicle_command_s *cmd, uint32_t result);
+
+#if defined(CONFIG_LOGGER_PREARM)
+	void update_pre_arm_buffer();
+#endif // CONFIG_LOGGER_PREARM
 
 	void handle_file_write_error();
 
@@ -370,7 +394,21 @@ private:
 	int						_num_excluded_optional_topic_ids{0};
 
 	LogWriter					_writer;
-	uint32_t					_log_interval{0};
+
+#if defined(CONFIG_LOGGER_PREARM)
+	LogWriterRam					*_pre_arm_writer {nullptr};
+	bool						_pre_arm_enabled{false};
+	size_t						_pre_arm_max_record_size{0};
+
+	hrt_abstime					_pre_arm_measure_start{0}; // grace period end; 0 once consumed
+	hrt_abstime					_pre_arm_measure_until{0}; // get log-throuput -> prearm-buffer-size
+	size_t						_pre_arm_measured_bytes{0};
+	size_t						_pre_arm_measured_records{0};
+	size_t						_pre_arm_buffer_size_bytes{0};
+	size_t						_pre_arm_max_records{0};
+#endif // CONFIG_LOGGER_PREARM
+
+	uint32_t					_log_interval {0};
 	float						_rate_factor{1.0f};
 	const orb_metadata				*_polling_topic_meta{nullptr}; ///< if non-null, poll on this topic instead of sleeping
 	orb_advert_t					_mavlink_log_pub{nullptr};

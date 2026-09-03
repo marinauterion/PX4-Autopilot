@@ -427,6 +427,10 @@ Logger::~Logger()
 
 	delete[](_msg_buffer);
 	delete[](_subscriptions);
+
+#if defined(CONFIG_LOGGER_PREARM)
+	delete _pre_arm_writer;
+#endif // CONFIG_LOGGER_PREARM
 }
 
 void Logger::update_params()
@@ -488,6 +492,106 @@ bool Logger::copy_if_updated(int sub_idx, void *buffer, bool try_to_subscribe)
 
 	return updated;
 }
+
+void Logger::pack_data_message_header(uint16_t msg_id, size_t msg_size)
+{
+	const uint16_t write_msg_size = static_cast<uint16_t>(msg_size - ULOG_MSG_HEADER_LEN);
+
+	//write one byte after another (necessary because of alignment)
+	_msg_buffer[0] = (uint8_t)write_msg_size;
+	_msg_buffer[1] = (uint8_t)(write_msg_size >> 8);
+	_msg_buffer[2] = static_cast<uint8_t>(ULogMessageType::DATA);
+	_msg_buffer[3] = (uint8_t)msg_id;
+	_msg_buffer[4] = (uint8_t)(msg_id >> 8);
+}
+
+#if defined(CONFIG_LOGGER_PREARM)
+void Logger::start_pre_arm_buffer()
+{
+	if (_pre_arm_measure_start != 0 || _pre_arm_measure_until != 0) {
+		return;
+	}
+
+	if (_pre_arm_max_record_size == 0) {
+		size_t max_topic_size = 0;
+
+		for (int sub = 0; sub < _num_subscriptions; ++sub) {
+			if (_subscriptions[sub].get_topic()->o_size_no_padding > max_topic_size) {
+				max_topic_size = _subscriptions[sub].get_topic()->o_size_no_padding;
+			}
+		}
+
+		_pre_arm_max_record_size = sizeof(PreArmRecordMetadata) + max_topic_size;
+	}
+
+	_pre_arm_writer = new LogWriterRam();
+
+	if (!_pre_arm_writer
+	    || !_pre_arm_writer->init(_pre_arm_buffer_size_bytes, _pre_arm_max_record_size, _pre_arm_max_records,
+				      PRE_ARM_WINDOW_DURATION)) {
+		PX4_ERR("pre-arm buffer alloc failed");
+		delete _pre_arm_writer;
+		_pre_arm_writer = nullptr;
+
+	} else {
+		_pre_arm_enabled = true;
+	}
+}
+
+void Logger::update_pre_arm_buffer()
+{
+	const hrt_abstime now = hrt_absolute_time();
+
+	if (_pre_arm_measure_start != 0) {
+		if (now < _pre_arm_measure_start) {
+			return; // still waiting out the initial subscribe-ahead burst
+		}
+
+		// grace period elapsed: start the real measurement window now
+		_pre_arm_measure_start = 0;
+		_pre_arm_measure_until = now + PRE_ARM_WINDOW_DURATION;
+	}
+
+	if (_pre_arm_measure_until != 0) {
+		if (now < _pre_arm_measure_until) {
+			// measure expected troughput
+			for (int sub_idx = 0; sub_idx < _num_subscriptions; ++sub_idx) {
+				LoggerSubscription &sub = _subscriptions[sub_idx];
+
+				if (sub.valid() && sub.update(_msg_buffer + sizeof(PreArmRecordMetadata))) {
+					_pre_arm_measured_bytes += sizeof(PreArmRecordMetadata) + sub.get_topic()->o_size_no_padding;
+					_pre_arm_measured_records++;
+				}
+			}
+
+			return;
+		}
+
+		// +25% margin
+		_pre_arm_measure_until = 0;
+		_pre_arm_buffer_size_bytes = _pre_arm_measured_bytes + _pre_arm_measured_bytes / 4;
+		_pre_arm_max_records = _pre_arm_measured_records + _pre_arm_measured_records / 4;
+		start_pre_arm_buffer();
+		PX4_INFO("pre-arm buffer: %zu bytes, %zu records", _pre_arm_buffer_size_bytes, _pre_arm_max_records);
+		// fall through: start logging directly
+	}
+
+	if (!_pre_arm_enabled || !_pre_arm_writer) {
+		return;
+	}
+
+	for (int sub_idx = 0; sub_idx < _num_subscriptions; ++sub_idx) {
+		LoggerSubscription &sub = _subscriptions[sub_idx];
+
+		if (sub.valid() && sub.update(_msg_buffer + sizeof(PreArmRecordMetadata))) {
+			const uint16_t data_len = sub.get_topic()->o_size_no_padding;
+			const PreArmRecordMetadata header{static_cast<uint16_t>(sub_idx), data_len};
+			memcpy(_msg_buffer, &header, sizeof(header));
+			_pre_arm_writer->write(_msg_buffer, sizeof(header) + data_len, now);
+		}
+	}
+}
+#endif // CONFIG_LOGGER_PREARM
 
 const char *Logger::configured_backend_mode() const
 {
@@ -648,6 +752,9 @@ void Logger::run()
 		}
 	}
 
+#if defined(CONFIG_LOGGER_PREARM)
+	_pre_arm_measure_start = hrt_absolute_time() + PRE_ARM_MEASURE_GRACE_PERIOD;
+#endif // CONFIG_LOGGER_PREARM
 
 	if (!_writer.init()) {
 		PX4_ERR("writer init failed");
@@ -720,6 +827,16 @@ void Logger::run()
 		/* check for logging command from MAVLink (start/stop streaming) */
 		handle_vehicle_command_update();
 
+#if defined(CONFIG_LOGGER_PREARM)
+
+		// gated on the FILE backend specifically (not is_started(LogType::Full), which also
+		// counts mavlink-streamed logging) - mavlink-only logging must not pause pre-arm capture
+		if (!_writer.is_started(LogType::Full, LogWriter::BackendFile)) {
+			update_pre_arm_buffer();
+		}
+
+#endif // CONFIG_LOGGER_PREARM
+
 		if (_timer_callback_data.watchdog_triggered.load()) {
 			_timer_callback_data.watchdog_triggered.store(false);
 			initialize_load_output(PrintLoadReason::Watchdog);
@@ -770,17 +887,7 @@ void Logger::run()
 				if (copy_if_updated(sub_idx, _msg_buffer + sizeof(ulog_message_data_s), try_to_subscribe)) {
 					// each message consists of a header followed by an orb data object
 					const size_t msg_size = sizeof(ulog_message_data_s) + sub.get_topic()->o_size_no_padding;
-					const uint16_t write_msg_size = static_cast<uint16_t>(msg_size - ULOG_MSG_HEADER_LEN);
-					const uint16_t write_msg_id = sub.msg_id;
-
-					//write one byte after another (necessary because of alignment)
-					_msg_buffer[0] = (uint8_t)write_msg_size;
-					_msg_buffer[1] = (uint8_t)(write_msg_size >> 8);
-					_msg_buffer[2] = static_cast<uint8_t>(ULogMessageType::DATA);
-					_msg_buffer[3] = (uint8_t)write_msg_id;
-					_msg_buffer[4] = (uint8_t)(write_msg_id >> 8);
-
-					// PX4_INFO("topic: %s, size = %zu, out_size = %zu", sub.get_topic()->o_name, sub.get_topic()->o_size, msg_size);
+					pack_data_message_header(sub.msg_id, msg_size);
 
 					// full log
 					if (write_message(LogType::Full, _msg_buffer, msg_size)) {
@@ -1502,6 +1609,41 @@ void Logger::start_log_file(LogType type)
 		}
 
 		write_all_add_logged_msg(type);
+
+#if defined(CONFIG_LOGGER_PREARM)
+
+		if (type == LogType::Full && _pre_arm_writer) {
+			_writer.lock();
+			_pre_arm_writer->drain([this](const void *blob, size_t blob_len) {
+				if (blob_len < sizeof(PreArmRecordMetadata)) {
+					return; // should not happen, buffer corrupted
+				}
+
+				PreArmRecordMetadata metadata;
+				memcpy(&metadata, blob, sizeof(metadata));
+
+				if (blob_len != sizeof(metadata) + metadata.data_len
+				    || metadata.sub_idx >= (uint16_t)_num_subscriptions) {
+					return; // should not happen
+				}
+
+				const void *data = static_cast<const uint8_t *>(blob) + sizeof(metadata);
+				const LoggerSubscription &sub = _subscriptions[metadata.sub_idx];
+				const size_t msg_size = sizeof(ulog_message_data_s) + metadata.data_len;
+				pack_data_message_header(sub.msg_id, msg_size);
+				memcpy(_msg_buffer + sizeof(ulog_message_data_s), data, metadata.data_len);
+
+				write_message(LogType::Full, _msg_buffer, msg_size);
+			});
+			_writer.unlock();
+
+			delete _pre_arm_writer;
+			_pre_arm_writer = nullptr;
+			_pre_arm_enabled = false;
+		}
+
+#endif // CONFIG_LOGGER_PREARM
+
 		_writer.set_need_reliable_transfer(false);
 		_writer.unselect_write_backend();
 		_writer.notify();
@@ -1526,6 +1668,10 @@ void Logger::stop_log_file(LogType type)
 		_writer.set_need_reliable_transfer(true);
 		write_perf_data(PrintLoadReason::Postflight);
 		_writer.set_need_reliable_transfer(false);
+
+#if defined(CONFIG_LOGGER_PREARM)
+		start_pre_arm_buffer(); // re-allocate and start refilling for the next potential arm
+#endif // CONFIG_LOGGER_PREARM
 	}
 
 	_writer.stop_log_file(type);

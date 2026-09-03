@@ -18,3 +18,13 @@ menuconfig LOGGER_STACK_SIZE
 	---help---
 		Stack size of the logger task. Some configurations require more stack
 		than the default.
+
+menuconfig LOGGER_PREARM
+	bool "pre-arm rolling log buffer"
+	default n
+	depends on MODULES_LOGGER
+	---help---
+		Continuously buffer the last 30 seconds of log data in RAM from boot,
+		and splice it into the log file when the vehicle arms, so every flight
+		log includes the seconds leading up to arming. Requires a few MB of
+		free RAM; only enable on boards with sufficient headroom.
